@@ -1,0 +1,13 @@
+name: radar-weather
+dependencies:
+  - python=3.11
+  - pip
+  - eccodes
+  - cfgrib
+  - xarray
+  - numpy
+  - requests
+  - fastapi
+  - uvicorn
+  - pip:
+      - aiofiles
