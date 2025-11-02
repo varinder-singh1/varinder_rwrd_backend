@@ -1,6 +1,7 @@
 import os
 import gzip
 import json
+import time
 import shutil
 import requests
 import xarray as xr
@@ -12,13 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="Radar Weather API",
     description="Provides latest MRMS Reflectivity at Lowest Altitude (RALA) data as JSON for frontend display.",
-    version="1.0"
+    version="1.1"
 )
 
-# Allow frontend to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to your frontend URL later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,30 +30,50 @@ GRIB_FILE = "reflectivity.grib2"
 JSON_FILE = "reflectivity.json"
 
 
+def safe_download():
+    """Download MRMS data in chunks with retry and handle incomplete reads."""
+    print("⏳ Downloading MRMS radar data...")
+
+    for attempt in range(3):
+        try:
+            with requests.get(MRMS_URL, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(GRIB_GZ, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            print("✅ File downloaded successfully.")
+            return
+        except Exception as e:
+            print(f"⚠️ Attempt {attempt+1} failed: {e}")
+            time.sleep(3)
+
+    raise Exception("❌ Download failed after 3 attempts")
+
+
 def download_and_extract():
-    """Download the latest MRMS Reflectivity file and decompress it."""
-    print("⏳ Downloading latest MRMS radar data...")
-    response = requests.get(MRMS_URL, stream=True, timeout=60)
-    response.raise_for_status()
+    """Download and decompress MRMS reflectivity file if cache is old."""
+    # Cache for 15 minutes
+    if os.path.exists(GRIB_FILE):
+        age = time.time() - os.path.getmtime(GRIB_FILE)
+        if age < 900:
+            print("⏩ Using cached radar file")
+            return
 
-    with open(GRIB_GZ, "wb") as f:
-        shutil.copyfileobj(response.raw, f)
+    safe_download()
 
-    with gzip.open(GRIB_GZ, "rb") as f_in:
-        with open(GRIB_FILE, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    with gzip.open(GRIB_GZ, "rb") as f_in, open(GRIB_FILE, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
 
-    print("✅ Downloaded and extracted:", GRIB_FILE)
+    print("✅ Extracted GRIB2 file.")
+
 
 def convert_to_json():
-    """Convert GRIB2 radar data into simplified JSON with lat/lon/value points."""
+    """Convert GRIB2 radar data into simplified JSON with lat/lon/value."""
     print("🔄 Converting GRIB2 to JSON...")
     ds = xr.open_dataset(GRIB_FILE, engine="cfgrib")
 
-    # Find reflectivity variable dynamically
     var_name = next((v for v in ds.data_vars if "Reflectivity" in v or "DZ" in v), list(ds.data_vars.keys())[0])
-
-    # Downsample (to reduce data size)
     ds_small = ds[var_name].isel(
         {
             list(ds[var_name].dims)[0]: slice(None, None, 20),
@@ -69,19 +89,14 @@ def convert_to_json():
     for i, la in enumerate(lat[::20]):
         for j, lo in enumerate(lon[::20]):
             val = float(values[i, j])
-            if val > -50:  # filter invalid/missing (-99, -999)
+            if val > -50:
                 lon_fixed = float(lo - 360 if lo > 180 else lo)
                 points.append({"lat": float(la), "lon": lon_fixed, "value": val})
 
-    # --- Safe timestamp extraction ---
     timestamp = ""
     if "time" in ds.coords:
         try:
-            time_val = ds.time.values.item()
-            if hasattr(time_val, "isoformat"):
-                timestamp = time_val.isoformat()
-            else:
-                timestamp = str(time_val)
+            timestamp = str(ds.time.values.item())
         except Exception:
             timestamp = str(ds.time.values)
 
@@ -98,17 +113,12 @@ def convert_to_json():
     with open(JSON_FILE, "w") as f:
         json.dump(data, f)
 
-    print(f"✅ Saved JSON with {len(points)} valid points")
+    print(f"✅ Saved JSON with {len(points)} valid points.")
     return data
-
 
 
 @app.get("/radar")
 def get_radar():
-    """
-    Returns the latest MRMS radar reflectivity points (latitude, longitude, value)
-    as a JSON response for map visualization.
-    """
     try:
         download_and_extract()
         data = convert_to_json()
